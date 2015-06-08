@@ -5,9 +5,10 @@ import time
 from subprocess import call, Popen, PIPE
 from datetime import datetime
 from math import sqrt
+from multiprocessing import Process, Queue
+from itertools import cycle
 
 import scipy.stats as st
-
 
 
 
@@ -48,19 +49,21 @@ def get_kmer_frequency(query):
     return freq
 
 
-# Get the k-mer frequencies for a SNV
-def get_frequencies(n, query):
+# Get the k-mer frequencies for an SNV
+def get_frequencies(queries):
     s2 = ""
     frequencies = [0, 0]
+    freqs = ["", ""]
+    iterator = cycle(range(2))
     # For every unique k-mer
-    for i in range(n):
-        count = []
-        # For both (two) allele variants
-        for j in range(2):
-            freq = get_kmer_frequency(query)
-            frequencies[j] += int(freq)
-            count.append(freq)
-        s2 += "\t" + "/".join(count)
+    for query in queries:
+        i = next(iterator)
+        query = query.strip()
+        freq = query.split("\t")[1]
+        frequencies[i] += int(freq)
+        freqs[i] = freq
+        if i == 1:
+            s2 += "\t" + "/".join(freqs)
     return frequencies, s2
 
 
@@ -82,25 +85,69 @@ def get_genotype(k, alleles, loc, frequencies, l, readlen, a):
     return decision
 
 
-# Identifies the SNV genotypes
-def find_snvs(k, a, l, readlen, snv_file, out_file, query_file):
-    with open(snv_file, "r") as snvs, open(query_file, "r") as query, open(out_file, "w") as w:
+def reader(taskq, snv_file, query_file, processes):
+    with open(snv_file, "r") as snvs, open(query_file, "r") as query:
         for line in snvs:
             parts = line.split("\t")
-            # rs_number chr pos ref_allele/alt_allele
-            s = "\t".join(parts[:4])
             n = len(parts) - 5
-            frequencies, s2 = get_frequencies(n)
+            tasks = [line]
+            for i in range(n*2):
+                tasks.append(query.readline())
+            taskq.put(tasks)
+    for i in range(processes):
+        taskq.put('STOP')
+    return
+
+
+def worker(taskq, doneq, k, l, readlen, a):
+    for tasks in iter(taskq.get, 'STOP'):
+        snv = tasks[0]
+        queries = tasks[1:]
+        parts = snv.split("\t")
+        s = "\t".join(parts[:4])
+        alleles = parts[3].split("/")
+        loc = int(parts[len(parts)-1])
+        frequencies, s2 = get_frequencies(queries)
+        if sum(frequencies) > 0:
             s += s2
-            # If none of the k-mers were found, the genotypes cannot be identified
-            if sum(frequencies) > 0:
-                alleles = parts[3].split("/")
-                loc = int(parts[n + 4])
-                decision = get_genotype(k, alleles, loc, frequencies, l, readlen, a)
-                if decision:
-                    # Only writes to file if the genotype is identified
-                    s += "\t" + decision + "\n"
-                    w.write(s)
+            decision = get_genotype(k, alleles, loc, frequencies, l, readlen, a)
+            if decision:
+                s += "\t" + decision + "\n"
+                doneq.put(s)
+    doneq.put('STOP')
+    return
+
+
+#def writer(doneq, out_file, processes):
+#    with open(out_file, "w") as w:
+#        for i in range(processes):
+#            for result in iter(doneq.get, 'STOP'):
+#                w.write(result)
+#    return
+
+
+# Identifies the SNV genotypes
+def find_snvs(k, a, l, readlen, snv_file, out_file, query_file, processes):
+    task_queue = Queue()
+    done_queue = Queue()
+    reader_pr = Process(target=reader, args=(task_queue, snv_file, query_file, processes))
+    reader_pr.start()
+    prs = []
+    for i in range(processes):
+        pr = Process(target=worker, args=(task_queue, done_queue, k, l, readlen, a))
+        pr.start()
+        prs.append(pr)
+    # writer_pr = Process(target=writer, args=(done_queue, out_file, processes))
+    # writer_pr.start()
+    with open(out_file, "w") as w:
+        for i in range(processes):
+            for result in iter(done_queue.get, 'STOP'):
+                w.write(result)
+    reader_pr.join()
+    for pr in prs:
+        pr.join()
+    # writer_pr.join()
+    return
 
 
 # Get command line arguments and create help
@@ -111,8 +158,12 @@ def parse_arguments():
     parser.add_argument('-sl', '--snplist', help='the file of kmers of snps from glistmaker', required=True)
     parser.add_argument('-l', '--list', help='list file of kmers of reads from glistmaker')
     parser.add_argument('-f', '--fastq', help='the fastq file(s) containing reads', nargs="+", required=True)
-    parser.add_argument('-a', '--alpha', help='the alpha value (significance level), default=0.1',
-                        type=float, default=0.1)
+    parser.add_argument('-r', '--query', help='results of glistquery')
+    parser.add_argument('-a', '--alpha', help='the alpha value (significance level), default=0.05',
+                        type=float, default=0.05)
+    parser.add_argument('-n', '--readcount', help='number of reads in fastq files', type=int)
+    parser.add_argument('-p', '--processes', help='the number of parallel worker processes, default=4, min=1, max=8',
+                        type=int, default=4, choices=range(1, 9))
     parser.add_argument('-if', '--infofile', help='the file for information (default stdout)')
     parser.add_argument('-o', '--output', help='the output file for the solution')
     parser.add_argument('-i', '--info', help='show information about the process', action='store_true')
@@ -135,8 +186,7 @@ def main():
     if args.infofile:
         infofile = open(args.infofile, "w")
 
-    if args.alpha:
-        alpha = args.alpha
+    alpha = args.alpha
 
     if args.output:
         out_file = args.output
@@ -145,21 +195,31 @@ def main():
 
     # Get the read length and count for estimating the mean and variance of k-mer frequencies
     fastq = args.fastq
-    p = Popen((['wc', '-l'] + fastq), stdout=PIPE, stderr=PIPE)
-    result, err = p.communicate()
-    if p.returncode != 0:
-        raise IOError(err)
-    result = result.decode()
-    lines = result.split("\n")
-    lastline = lines[len(lines) - 2]
-    n = round(int(lastline.strip().split()[0]) / 4)
+    if args.readcount:
+        n = args.readcount
+    else:
+        if info:
+            s = "Counting the reads\n"
+            if args.infofile:
+                infofile.write(s)
+            else:
+                print(s)
+        p = Popen((['wc', '-l'] + fastq), stdout=PIPE, stderr=PIPE)
+        result, err = p.communicate()
+        if p.returncode != 0:
+            raise IOError(err)
+        result = result.decode()
+        lines = result.split("\n")
+        lastline = lines[len(lines) - 2]
+        n = round(int(lastline.strip().split()[0]) / 4)
     # n = 952864636
 
+    # lambda value - the number of reads starting from a position
     l = n / 3000000000
 
-    file1 = open(fastq[0], "r")
-    file1.readline()
-    readlen = len(file1.readline().strip())
+    with open(fastq[0], "r") as file1:
+        file1.readline()
+        readlen = len(file1.readline().strip())
 
     if info:
         s = "lambda " + str(l) + "\nreadlen " + str(readlen) + "\nnr of reads " + str(n) + "\n"
@@ -189,21 +249,24 @@ def main():
             else:
                 print(s)
         list_small = out_file[:-4] + "_small_" + str(k) + "_intrsec.list"
-        call("/mambakodu/fanny/maka/glistcompare " + list_file + " " + args.snplist + " -i -r first -o " +  out_file[:-4] + "_small",
-             shell=True)
+        call("/mambakodu/fanny/maka/glistcompare " + list_file + " " + args.snplist + " -i -r first -o " +
+             out_file[:-4] + "_small", shell=True)
     time_list_2 = time.time()
 
     # Find the frequencies for the unique k-mers from the list files
     time_query_1 = time.time()
-    if info:
-        s = "Running glistquery to find the kmer frequencies from the reads\n"
-        if args.infofile:
-            infofile.write(s)
-        else:
-            print(s)
-    query_result = "query_results_" + time_string + ".txt"
-    call("/mambakodu/fanny/maka/glistquery " + list_small + " -f " + args.sequences + " > " +
-         query_result, shell=True)
+    if args.query:
+        query_result = args.query
+    else:
+        if info:
+            s = "Running glistquery to find the kmer frequencies from the reads\n"
+            if args.infofile:
+                infofile.write(s)
+            else:
+                print(s)
+        query_result = "query_results_" + time_string + ".txt"
+        call("/mambakodu/fanny/maka/glistquery " + list_small + " -f " + args.sequences + " > " +
+             query_result, shell=True)
     time_query_2 = time.time()
 
     # Find the SNV genotypes
@@ -215,7 +278,7 @@ def main():
         else:
             print(s)
     snp_file = args.snp
-    find_snvs(k, alpha, l, readlen, snp_file, out_file, query_result)
+    find_snvs(k, alpha, l, readlen, snp_file, out_file, query_result, args.processes)
     time_snps_2 = time.time()
 
     # Output program time information
